@@ -1,0 +1,364 @@
+C51 COMPILER V9.60.7.0   MAIN                                                              03/31/2026 22:18:12 PAGE 1   
+
+
+C51 COMPILER V9.60.7.0, COMPILATION OF MODULE MAIN
+OBJECT MODULE PLACED IN .\Objects\main.obj
+COMPILER INVOKED BY: D:\Keil5\C51\BIN\C51.EXE main.c OPTIMIZE(8,SPEED) BROWSE DEBUG OBJECTEXTEND PRINT(.\Listings\main.l
+                    -st) OBJECT(.\Objects\main.obj)
+
+line level    source
+
+   1          #include <STC89C5xRC.H>
+   2          #include "Delay.h"
+   3          #include "Timer0.h"
+   4          #include "Timer1.h"
+   5          #include "Music.h"
+   6          #include "Nixie.h"
+   7          
+   8          sbit Key1=P3^1;  //按键1：暂停/继续
+   9          sbit Key2=P3^0;  //按键2：倍速切换
+  10          
+  11          #define SPEED           500           //四分音符500ms
+  12          #define NOTE_VALUE_MS   (SPEED/4)     //音符时值对应的毫秒，即1时值对应四分之一的SPEED
+  13          #define NOTE_GAP_MS     5             //每个音符结束后进行5ms的小停顿，避免音符连在一
+             -起发声
+  14          
+  15          //播放器的四种状态
+  16          #define PLAYER_LOAD     0      //空闲状态或者准备加载新音符
+  17          #define PLAYER_NOTE     1      //当前正在播放一个音符
+  18          #define PLAYER_GAP      2      //音符已经结束，正在经历音符间隔5ms
+  19          #define PLAYER_END      3      //整首歌已播放完
+  20          
+  21          //在中断和主程序间共享的全局变量加volatile，每次使用都必须从内存重新读取
+  22          volatile unsigned char FreqSelect=0;     //当前正在播放的音符编号
+  23          unsigned char MusicSelect=0;             //当前读到乐谱数组的哪个位置，每加载一个音符
+             -，MusicSelect会加2
+  24          
+  25          unsigned char PlayerMode=PLAYER_LOAD;    //表示现在播放器在哪个状态0,1,2,3
+  26          bit PauseFlag=0;                         //暂停标志，0：正常播放 1：暂停
+  27          
+  28          unsigned int NoteRemainMs=0;             //当前音符还剩多少毫秒播放
+  29          unsigned int GapRemainMs=0;              //当前音符结束后的短暂停顿还剩多少毫秒
+  30          
+  31          unsigned long PlayedTime=0;              //已经播放过的总时间
+  32          unsigned long TotalTime=1;               //整首歌的总时长
+  33          
+  34          unsigned char SpeedIndex=1;                         //倍速档位索引
+  35          unsigned char SpeedLevelTable[]={1, 2, 4, 8};       //除2得到倍速0.5 1 2 4
+  36          unsigned char SpeedStep=2;                          //当前档位对应的实际步进值
+  37          unsigned char SpeedCounter=0;                       //速度计数，判断经过了多少毫秒
+  38          
+  39          unsigned char Display[8]={0,0,0,10,10,10,10,2};     //数码管显示
+  40          
+  41          volatile unsigned char Timer1_1msCount=0;           //Timer1已经进行了多少次1ms的计数
+  42          
+  43          //函数声明
+  44          void DisplayScan(void);                               //动态扫描数码管
+  45          void DisplayUpdate(void);                             //显示内容更新
+  46          void KeyScan(void);                                   //按键扫描
+  47          void PlayerLoadNote(void);                            //装载音符
+  48          void Player1ms(void);                                 //播放器推进1ms
+  49          void PlayerPause(void);                               //暂停或继续
+  50          void PlayerChangeSpeed(void);                         //倍速切换
+  51          unsigned long GetMusicTotalTime(void);                //计算总时长
+  52          
+C51 COMPILER V9.60.7.0   MAIN                                                              03/31/2026 22:18:12 PAGE 2   
+
+  53          
+  54          void main()
+  55          {
+  56   1          TotalTime=GetMusicTotalTime();
+  57   1          
+  58   1          Timer0Init();
+  59   1          Timer1Init();
+  60   1          
+  61   1          PlayerLoadNote();
+  62   1          
+  63   1          while(1)
+  64   1          {
+  65   2              while(Timer1_1msCount)
+  66   2              {
+  67   3                  EA=0;
+  68   3                  Timer1_1msCount--;
+  69   3                  EA=1;
+  70   3                  
+  71   3                  DisplayScan();
+  72   3                  KeyScan();
+  73   3                  Player1ms();
+  74   3                  DisplayUpdate();
+  75   3              }
+  76   2          }
+  77   1          
+  78   1      }
+  79          
+  80          unsigned long GetMusicTotalTime(void)
+  81          {
+  82   1          unsigned char i=0;
+  83   1          unsigned long total=0;
+  84   1      
+  85   1          while(Music[i]!=0xFF)
+  86   1          {
+  87   2              total+=(unsigned long)NOTE_VALUE_MS * Music[i+1];
+  88   2              total+= NOTE_GAP_MS;
+  89   2              i+=2;  //读下一对
+  90   2          }
+  91   1      
+  92   1          if(total==0) total=1;
+  93   1          return total;
+  94   1      }
+  95          
+  96          
+  97          void PlayerLoadNote(void)
+  98          {
+  99   1          unsigned char note;
+ 100   1          unsigned char timeValue;
+ 101   1          unsigned int reloadValue;
+ 102   1      
+ 103   1          if(Music[MusicSelect]==0xFF)  //判断歌曲有没有结束
+ 104   1          {
+ 105   2              PlayerMode=PLAYER_END;
+ 106   2              FreqSelect=0;
+ 107   2              TR0=0;
+ 108   2              PlayedTime=TotalTime;
+ 109   2              return;
+ 110   2          }
+ 111   1      
+ 112   1          //读取音符和时值
+ 113   1          note=Music[MusicSelect++];
+ 114   1          timeValue=Music[MusicSelect++];
+C51 COMPILER V9.60.7.0   MAIN                                                              03/31/2026 22:18:12 PAGE 3   
+
+ 115   1      
+ 116   1          FreqSelect=note;
+ 117   1          NoteRemainMs=NOTE_VALUE_MS*timeValue;
+ 118   1          GapRemainMs=NOTE_GAP_MS;
+ 119   1          PlayerMode=PLAYER_NOTE;
+ 120   1      
+ 121   1          if((PauseFlag==0)&&(FreqSelect!= P))
+ 122   1          {
+ 123   2              reloadValue=FreqTable[FreqSelect];
+ 124   2              TH0=reloadValue/256;
+ 125   2              TL0=reloadValue%256;
+ 126   2              TR0=1;
+ 127   2          }
+ 128   1          else
+ 129   1          {
+ 130   2              TR0=0;
+ 131   2          }
+ 132   1      }
+ 133          
+ 134          void Player1ms(void)
+ 135          {
+ 136   1          if(PauseFlag||PlayerMode==PLAYER_END)  //如果暂停或结束，就什么都不做
+ 137   1          {
+ 138   2              return;
+ 139   2          }
+ 140   1      
+ 141   1          SpeedCounter+=SpeedStep;  //按倍速推进时间
+ 142   1      
+ 143   1          while(SpeedCounter>=2)
+ 144   1          {
+ 145   2              SpeedCounter-=2;
+ 146   2      
+ 147   2              if(PlayerMode==PLAYER_LOAD)
+ 148   2              {
+ 149   3                  PlayerLoadNote();
+ 150   3              }
+ 151   2              else if(PlayerMode==PLAYER_NOTE)  //减少剩余时间
+ 152   2              {
+ 153   3                  if(NoteRemainMs>0)
+ 154   3                  {
+ 155   4                      NoteRemainMs--;
+ 156   4                      if(PlayedTime<TotalTime) PlayedTime++;
+ 157   4                  }
+ 158   3      
+ 159   3                  if(NoteRemainMs==0)
+ 160   3                  {
+ 161   4                      TR0=0;
+ 162   4                      PlayerMode=PLAYER_GAP;
+ 163   4                  }
+ 164   3              }
+ 165   2              else if(PlayerMode==PLAYER_GAP)  //减少间隔时间
+ 166   2              {
+ 167   3                  if(GapRemainMs>0)
+ 168   3                  {
+ 169   4                      GapRemainMs--;
+ 170   4                      if(PlayedTime<TotalTime) PlayedTime++;
+ 171   4                  }
+ 172   3      
+ 173   3                  if(GapRemainMs==0)
+ 174   3                  {
+ 175   4                      PlayerLoadNote();
+ 176   4                  }
+C51 COMPILER V9.60.7.0   MAIN                                                              03/31/2026 22:18:12 PAGE 4   
+
+ 177   3              }
+ 178   2          }
+ 179   1      }
+ 180          
+ 181          
+ 182          void PlayerPause(void)
+ 183          {
+ 184   1          unsigned int reloadValue;
+ 185   1      
+ 186   1          PauseFlag=!PauseFlag;  //翻转暂停状态
+ 187   1      
+ 188   1          if(PauseFlag)
+ 189   1          {
+ 190   2              TR0 = 0;
+ 191   2          }
+ 192   1          else
+ 193   1          {
+ 194   2              if((PlayerMode==PLAYER_NOTE)&&(FreqSelect!=P))
+ 195   2              {
+ 196   3                  reloadValue=FreqTable[FreqSelect];
+ 197   3                  TH0=reloadValue/256;
+ 198   3                  TL0=reloadValue%256;
+ 199   3                  TR0=1;
+ 200   3              }
+ 201   2          }
+ 202   1      }
+ 203          
+ 204          
+ 205          void PlayerChangeSpeed(void)
+ 206          {
+ 207   1          SpeedIndex++;
+ 208   1          if(SpeedIndex>=4) SpeedIndex=0;
+ 209   1          SpeedStep=SpeedLevelTable[SpeedIndex];  //根据新档位，更新SpeedStep
+ 210   1      }
+ 211          
+ 212          void KeyScan(void)
+ 213          {
+ 214   1          static unsigned char key5ms=0;  //5ms扫一次
+ 215   1          //按键消抖计数器
+ 216   1          static unsigned char k1_count=0;
+ 217   1          static unsigned char k2_count=0;
+ 218   1          //按键锁定标志
+ 219   1          static bit k1_lock=0;
+ 220   1          static bit k2_lock=0;
+ 221   1      
+ 222   1          key5ms++;
+ 223   1          if(key5ms < 5) return;
+ 224   1          key5ms=0;
+ 225   1      
+ 226   1          // Key1 -> 暂停/继续
+ 227   1          if(Key1==0)
+ 228   1          {
+ 229   2              if(k1_count<4) k1_count++;
+ 230   2              else
+ 231   2              {
+ 232   3                  if(k1_lock==0)
+ 233   3                  {
+ 234   4                      k1_lock=1;
+ 235   4                      PlayerPause();
+ 236   4                  }
+ 237   3              }
+ 238   2          }
+C51 COMPILER V9.60.7.0   MAIN                                                              03/31/2026 22:18:12 PAGE 5   
+
+ 239   1          else
+ 240   1          {
+ 241   2              k1_count=0;
+ 242   2              k1_lock=0;
+ 243   2          }
+ 244   1      
+ 245   1          // Key2 -> 倍速切换
+ 246   1          if(Key2==0)
+ 247   1          {
+ 248   2              if(k2_count<4) k2_count++;
+ 249   2              else
+ 250   2              {
+ 251   3                  if(k2_lock==0)
+ 252   3                  {
+ 253   4                      k2_lock=1;
+ 254   4                      PlayerChangeSpeed();
+ 255   4                  }
+ 256   3              }
+ 257   2          }
+ 258   1          else
+ 259   1          {
+ 260   2              k2_count=0;
+ 261   2              k2_lock=0;
+ 262   2          }
+ 263   1      }
+ 264          
+ 265          void DisplayUpdate(void)
+ 266          {
+ 267   1          unsigned char percent;
+ 268   1      
+ 269   1          if(PlayerMode==PLAYER_END)
+ 270   1          {
+ 271   2              percent=100;
+ 272   2          }
+ 273   1          else
+ 274   1          {
+ 275   2              percent=(unsigned char)((PlayedTime*100 + TotalTime/2)/TotalTime);  //四舍五入
+ 276   2              if(percent>100) percent=100;
+ 277   2          }
+ 278   1      
+ 279   1          Display[0]=percent/100;
+ 280   1          Display[1]=(percent/10)%10;
+ 281   1          Display[2]=percent%10;
+ 282   1      
+ 283   1          Display[3]=10;
+ 284   1          Display[4]=10;
+ 285   1          Display[5]=10;
+ 286   1          Display[6]=10;
+ 287   1      
+ 288   1          Display[7]=SpeedIndex+1;
+ 289   1      }
+ 290          
+ 291          void DisplayScan(void)  //每次只刷新一位数码管
+ 292          {
+ 293   1          static unsigned char pos=0;
+ 294   1      
+ 295   1          P0=0x00;  //消影
+ 296   1          DisplaySelect(pos+1);
+ 297   1          P0=NixieTable[Display[pos]];
+ 298   1      
+ 299   1          pos++;
+ 300   1          if(pos>=8) pos=0;
+C51 COMPILER V9.60.7.0   MAIN                                                              03/31/2026 22:18:12 PAGE 6   
+
+ 301   1      }
+ 302          
+ 303          
+ 304          //Timer0中断：蜂鸣器发声
+ 305          void Timer0_Routine() interrupt 1
+ 306          {
+ 307   1          if(FreqTable[FreqSelect])   //如果不是休止符
+ 308   1          {
+ 309   2              /*取对应频率值的重装载值到定时器*/
+ 310   2              TL0=FreqTable[FreqSelect]%256;
+ 311   2              TH0=FreqTable[FreqSelect]/256;
+ 312   2              Buzzer=!Buzzer; //翻转蜂鸣器IO口
+ 313   2          }
+ 314   1              
+ 315   1          
+ 316   1      }
+ 317          
+ 318          //Timer1中断：给1ms的节拍 
+ 319          void Timer1_Routine() interrupt 3
+ 320          {
+ 321   1          TH1=0xFC;
+ 322   1          TL1=0x66;
+ 323   1      
+ 324   1          if(Timer1_1msCount<200)
+ 325   1          {
+ 326   2              Timer1_1msCount++;
+ 327   2          }
+ 328   1      }
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =    882    ----
+   CONSTANT SIZE    =    326    ----
+   XDATA SIZE       =   ----    ----
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =     35       4
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =      3    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)
